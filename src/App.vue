@@ -500,12 +500,15 @@ import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue';
 import { Editor, rootCtx, defaultValueCtx, editorViewCtx, serializerCtx } from '@milkdown/kit/core';
 import { commonmark } from '@milkdown/kit/preset/commonmark';
 import { gfm } from '@milkdown/kit/preset/gfm';
-import { replaceAll, $nodeSchema } from '@milkdown/kit/utils';
+import { replaceAll, $nodeSchema, $remark } from '@milkdown/kit/utils';
 import { listener, listenerCtx } from '@milkdown/kit/plugin/listener';
-import remarkDirective from 'remark-directive';
+import remarkDirectivePlugin from 'remark-directive';
 import { marked } from 'marked';
 import DOMPurify from 'dompurify';
 import TurndownService from 'turndown';
+
+// remark-directive 必须用 $remark 包装：内部访问 self.data()，只有经 unified 调用才能拿到正确 this
+const remarkDirective = $remark('remarkDirective', () => remarkDirectivePlugin);
 
 // ---------- Toast 通知 ----------
 const toast = ref({ show: false, message: '', type: 'success' });
