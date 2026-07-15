@@ -500,8 +500,10 @@ import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue';
 import { Editor, rootCtx, defaultValueCtx, editorViewCtx, serializerCtx } from '@milkdown/kit/core';
 import { commonmark } from '@milkdown/kit/preset/commonmark';
 import { gfm } from '@milkdown/kit/preset/gfm';
-import { replaceAll } from '@milkdown/kit/utils';
-import { listener, listenerCtx } from '@milkdown/plugin-listener';
+import { replaceAll, insert, $remark, $nodeSchema, $view } from '@milkdown/kit/utils';
+import { listener, listenerCtx } from '@milkdown/kit/plugin/listener';
+import remarkDirective from 'remark-directive';
+import { visit } from 'unist-util-visit';
 import { marked } from 'marked';
 import DOMPurify from 'dompurify';
 import TurndownService from 'turndown';
@@ -1162,6 +1164,12 @@ const editorThemeCss = computed(() => {
   const t = { ...base };
   const brand = currentBrand();
 
+  // 装饰元素配色：与 buildHtml 完全一致（从 base 主题提取，避免品牌覆盖后错位）
+  const themeAccent = (base.h1 || '').match(/color:\s*(#[0-9a-fA-F]{3,8})/i)?.[1] || '#333';
+  const quoteBg = (base.blockquote || '').match(/background:\s*(#[0-9a-fA-F]{3,8})/i)?.[1] || _brandShade(themeAccent, 82);
+  const quoteText = (base.blockquote || '').match(/color:\s*(#[0-9a-fA-F]{3,8})/i)?.[1] || '#555';
+  const decorColor = brand.color || themeAccent;
+
   // 品牌色：重染强调色（与 buildHtml 完全一致）
   if (brand.color) {
     ['h1', 'a', 'blockquote'].forEach(tag => {
@@ -1183,11 +1191,16 @@ const editorThemeCss = computed(() => {
   const styleableTags = ['h1','h2','h3','h4','h5','h6','p','blockquote','ul','ol','li','img','a','code','pre','hr','table','th','td','strong','em','del','mark'];
   const rules = [];
 
-  // 容器样式（从 body 派生）
-  rules.push(`.milkdown-theme-editor { ${t.body}; min-height: 100%; }`);
+  // 容器样式（从 body 派生）+ 装饰元素 CSS 变量
+  rules.push(`.milkdown-theme-editor { ${t.body}; min-height: 100%; --decor-color: ${decorColor}; --quote-bg: ${quoteBg}; --quote-text: ${quoteText}; }`);
   // Milkdown 编辑区容器
   rules.push(`.milkdown-theme-editor .milkdown { padding: 24px 32px; min-height: 100%; outline: none; }`);
   rules.push(`.milkdown-theme-editor .milkdown .ProseMirror { min-height: 100%; outline: none; }`);
+  // 装饰元素在编辑器内的渲染样式
+  rules.push(`.milkdown-theme-editor .milkdown-decor-cover { text-align: center; padding: 36px 20px 32px; margin: 32px 0; border-top: 3px solid var(--decor-color); border-bottom: 1px solid var(--decor-color); }`);
+  rules.push(`.milkdown-theme-editor .milkdown-decor-cover h1 { margin: 0; color: var(--decor-color); }`);
+  rules.push(`.milkdown-theme-editor .milkdown-decor-divider { text-align: center; color: var(--decor-color); font-size: 20px; letter-spacing: 14px; margin: 28px 0; line-height: 1; }`);
+  rules.push(`.milkdown-theme-editor .milkdown-decor-quote { margin: 16px 0; padding: 20px 24px; border-radius: 8px; border-left: 4px solid var(--decor-color); background: var(--quote-bg); color: var(--quote-text); font-size: 17px; line-height: 1.8; }`);
 
   styleableTags.forEach(tag => {
     let style = t[tag] || '';
@@ -1364,15 +1377,79 @@ const buildQuoteSection = (text, decorColor, quoteBg, quoteText) => {
   return `<section style="margin:16px 0;padding:20px 24px;border-radius:8px;border-left:4px solid ${decorColor};background:${quoteBg};color:${quoteText};font-size:17px;line-height:1.8;">${text}</section>`;
 };
 
-// 光标处插入装饰块（::: container 语法，用户可见可编辑）
-// Phase 1: 追加到末尾（Milkdown 无 textarea）；Phase 2 改用 Milkdown insert API 插入光标处
+// ---------- Milkdown 装饰节点插件（cover / divider / quote） ----------
+// 让 ::: 容器语法在编辑器内可视化，并与 buildHtml 输出保持一致
+
+// 从 remark-directive 容器中提取所有文本
+const extractDirectiveText = (node) => {
+  if (!node.children) return '';
+  const texts = [];
+  const walk = (n) => {
+    if (n.type === 'text') texts.push(n.value);
+    if (n.children) n.children.forEach(walk);
+  };
+  walk(node);
+  return texts.join('');
+};
+
+const directiveRemark = $remark('decorDirective', () => remarkDirective);
+
+const createDirectiveNode = (type) => $nodeSchema(`${type}Directive`, () => ({
+  content: type === 'divider' ? '' : 'text*',
+  group: 'block',
+  attrs: {
+    text: { default: '' },
+  },
+  parseMarkdown: {
+    match: (node) => node.type === 'containerDirective' && node.name === type,
+    runner: (state, node, treeType) => {
+      const text = extractDirectiveText(node);
+      state.openNode(treeType, { text });
+      if (type !== 'divider') state.addText(text);
+      state.closeNode();
+    },
+  },
+  toMarkdown: {
+    match: (n) => n.type.name === `${type}Directive`,
+    runner: (state, node) => {
+      state.openNode('containerDirective', undefined, { name: type });
+      if (type !== 'divider') {
+        state.openNode('paragraph');
+        state.addText(node.textContent || node.attrs.text || '');
+        state.closeNode();
+      }
+      state.closeNode();
+    },
+  },
+  toDOM: (node) => {
+    if (type === 'cover') {
+      return ['div', { class: 'milkdown-decor-cover', 'data-decor-type': 'cover' }, ['h1', 0]];
+    }
+    if (type === 'divider') {
+      return ['div', { class: 'milkdown-decor-divider', 'data-decor-type': 'divider' }, ['span', '※ ※ ※']];
+    }
+    return ['section', { class: 'milkdown-decor-quote', 'data-decor-type': 'quote' }, 0];
+  },
+}));
+
+const coverDirective = createDirectiveNode('cover');
+const dividerDirective = createDirectiveNode('divider');
+const quoteDirective = createDirectiveNode('quote');
+
+const decorDirectivePlugin = [directiveRemark, coverDirective, dividerDirective, quoteDirective];
+
+// 光标处插入装饰块（::: container 语法，编辑器内可视化）
 const insertDecorBlock = (type) => {
   const labels = { cover: '封面卡片', divider: '分割线', quote: '金句卡片' };
   const content = type === 'divider'
     ? '\n::: divider\n\n:::\n'
     : `\n::: ${type}\n点击编辑文字\n:::\n`;
 
-  markdownText.value = markdownText.value + content;
+  if (milkdownEditor) {
+    milkdownEditor.action(insert(content));
+  } else {
+    markdownText.value += content;
+  }
   showToast(`已插入${labels[type] || '装饰元素'}`, 'success');
 };
 
@@ -1705,6 +1782,7 @@ onMounted(async () => {
       .use(listener)
       .use(commonmark)
       .use(gfm)
+      .use(decorDirectivePlugin)
       .create();
   } catch (e) {
     console.error('Milkdown 初始化失败:', e);
