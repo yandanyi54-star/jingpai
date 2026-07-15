@@ -1,0 +1,22 @@
+{
+  "name": "jingpai",
+  "version": "0.1.0",
+  "private": true,
+  "description": "公众号创作者工具 — 帮助排版、支持调整、快速配图、一键发布",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "dompurify": "^3.1.5",
+    "marked": "^18.0.5",
+    "md-editor-v3": "^4.14.0",
+    "turndown": "^7.2.4",
+    "vue": "^3.4.30"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.0.5",
+    "vite": "^5.3.3"
+  }
+}
