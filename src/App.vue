@@ -473,12 +473,7 @@
       <!-- 编辑器区域 -->
       <section class="editor-section">
         <div class="editor-container">
-          <MdEditor
-            ref="editorRef"
-            v-model="markdownText"
-            language="zh-CN"
-            :editor-class="'notion-editor'"
-          />
+          <div class="milkdown-theme-editor" ref="milkdownContainer"></div>
         </div>
         <div class="status-bar">
           <span class="status-privacy">🔒 {{ savedLabel }} · 内容仅存本机</span>
@@ -501,9 +496,12 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, onMounted, nextTick } from 'vue';
-import { MdEditor } from 'md-editor-v3';
-import 'md-editor-v3/lib/style.css';
+import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue';
+import { Editor, rootCtx, defaultValueCtx, editorViewCtx, serializerCtx } from '@milkdown/kit/core';
+import { commonmark } from '@milkdown/kit/preset/commonmark';
+import { gfm } from '@milkdown/kit/preset/gfm';
+import { replaceAll } from '@milkdown/kit/utils';
+import { listener, listenerCtx } from '@milkdown/plugin-listener';
 import { marked } from 'marked';
 import DOMPurify from 'dompurify';
 import TurndownService from 'turndown';
@@ -592,7 +590,10 @@ const DEFAULT_CONTENT = `# 欢迎使用 净排
 开始写点什么吧 ✍️`;
 
 const markdownText = ref(DEFAULT_CONTENT);
-const editorRef = ref(null);
+const milkdownContainer = ref(null);
+let milkdownEditor = null;
+let isFromEditor = false;
+let isSettingEditor = false;
 const previewHtml = ref('');
 const currentTheme = ref('serif_news');
 
@@ -1140,6 +1141,85 @@ const currentBrand = () => ({
 const renderHtml = () =>
   DOMPurify.sanitize(buildHtml(markdownText.value, currentTheme.value, customOverrides.value, currentBrand()));
 
+// ---------- Milkdown 编辑器：getMarkdown / themeToCss ----------
+const getMarkdown = () => {
+  if (!milkdownEditor) return markdownText.value;
+  try {
+    return milkdownEditor.action((ctx) => {
+      const serializer = ctx.get(serializerCtx);
+      const view = ctx.get(editorViewCtx);
+      return serializer(view.state.doc);
+    });
+  } catch (e) {
+    return markdownText.value;
+  }
+};
+
+// 把 THEMES 转为 CSS 规则，注入 .milkdown-theme-editor 容器
+// 与 buildHtml 共用同一份 THEMES + 品牌色 + 覆盖逻辑，保证所见即所得
+const editorThemeCss = computed(() => {
+  const base = THEMES[currentTheme.value] || THEMES.serif_news;
+  const t = { ...base };
+  const brand = currentBrand();
+
+  // 品牌色：重染强调色（与 buildHtml 完全一致）
+  if (brand.color) {
+    ['h1', 'a', 'blockquote'].forEach(tag => {
+      if (t[tag]) {
+        t[tag] = t[tag]
+          .replace(/color:[^;]+/, 'color:' + brand.color)
+          .replace(/(border-left:[^;]*?)(#[0-9a-fA-F]{3,8})/i, '$1' + brand.color);
+      }
+    });
+  }
+  if (brand.font) {
+    t.body = t.body.replace(/font-family:[^;]+/, 'font-family:' + brand.font);
+  }
+  // 强制白底 + 深色正文（与 buildHtml 一致）
+  t.body = t.body
+    .replace(/background:[^;]+/, 'background:#ffffff')
+    .replace(/color:[^;]+/, 'color:#1a1a1a');
+
+  const styleableTags = ['h1','h2','h3','h4','h5','h6','p','blockquote','ul','ol','li','img','a','code','pre','hr','table','th','td','strong','em','del','mark'];
+  const rules = [];
+
+  // 容器样式（从 body 派生）
+  rules.push(`.milkdown-theme-editor { ${t.body}; min-height: 100%; }`);
+  // Milkdown 编辑区容器
+  rules.push(`.milkdown-theme-editor .milkdown { padding: 24px 32px; min-height: 100%; outline: none; }`);
+  rules.push(`.milkdown-theme-editor .milkdown .ProseMirror { min-height: 100%; outline: none; }`);
+
+  styleableTags.forEach(tag => {
+    let style = t[tag] || '';
+    // 用户覆盖（与 buildHtml 逻辑一致）
+    if (customOverrides.value[tag]) {
+      const ov = customOverrides.value[tag];
+      const parts = [];
+      if (ov['font-size']) parts.push(`font-size:${ov['font-size']}`);
+      if (ov['color']) parts.push(`color:${ov['color']}`);
+      if (ov['line-height']) parts.push(`line-height:${ov['line-height']}`);
+      if (ov['letter-spacing']) parts.push(`letter-spacing:${ov['letter-spacing']}px`);
+      if (parts.length) style = t[tag] ? t[tag] + ';' + parts.join(';') : parts.join(';');
+    }
+    if (style) {
+      rules.push(`.milkdown-theme-editor ${tag} { ${style}; }`);
+    }
+  });
+
+  return rules.join('\n');
+});
+
+// 注入/更新编辑器主题 CSS（watcher 方式，自动响应主题/品牌/覆盖变化）
+watch(editorThemeCss, (css) => {
+  let el = document.getElementById('milkdown-theme-css');
+  if (!el) {
+    el = document.createElement('style');
+    el.id = 'milkdown-theme-css';
+    document.head.appendChild(el);
+  }
+  el.textContent = css;
+}, { immediate: true });
+
 // ---------- 核心转换 ----------
 const convertMarkdown = () => {
   try {
@@ -1285,30 +1365,14 @@ const buildQuoteSection = (text, decorColor, quoteBg, quoteText) => {
 };
 
 // 光标处插入装饰块（::: container 语法，用户可见可编辑）
+// Phase 1: 追加到末尾（Milkdown 无 textarea）；Phase 2 改用 Milkdown insert API 插入光标处
 const insertDecorBlock = (type) => {
   const labels = { cover: '封面卡片', divider: '分割线', quote: '金句卡片' };
   const content = type === 'divider'
     ? '\n::: divider\n\n:::\n'
     : `\n::: ${type}\n点击编辑文字\n:::\n`;
 
-  const md = markdownText.value;
-  const ta = editorRef.value?.$el?.querySelector('textarea');
-  if (ta && ta.selectionStart !== undefined) {
-    const start = ta.selectionStart;
-    const end = ta.selectionEnd;
-    markdownText.value = md.slice(0, start) + content + md.slice(end);
-    // 选中「点击编辑文字」，提示用户立即编辑
-    if (type !== 'divider') {
-      nextTick(() => {
-        const selStart = start + content.indexOf('点击编辑文字');
-        const selEnd = selStart + '点击编辑文字'.length;
-        ta.focus();
-        ta.setSelectionRange(selStart, selEnd);
-      });
-    }
-  } else {
-    markdownText.value = md + content;
-  }
+  markdownText.value = markdownText.value + content;
   showToast(`已插入${labels[type] || '装饰元素'}`, 'success');
 };
 
@@ -1595,10 +1659,21 @@ const toggleThemeDropdown = () => {
 };
 
 // ---------- 监听编辑器内容变化 ----------
+// 异步 watch：更新预览 + 保存草稿（保持原有行为）
 watch(markdownText, () => {
   convertMarkdown();
   saveDraft();
 });
+
+// 同步 watch：外部修改 markdownText 时推送到 Milkdown 编辑器
+// 编辑器内部修改时 isFromEditor=true，跳过推送避免循环
+watch(markdownText, (newMd) => {
+  if (!isFromEditor && milkdownEditor) {
+    isSettingEditor = true;
+    milkdownEditor.action(replaceAll(newMd));
+    isSettingEditor = false;
+  }
+}, { flush: 'sync' });
 
 // 监听设置变化
 watch([previewPosition, previewWidth, phoneModel, showPreview], () => {
@@ -1606,17 +1681,45 @@ watch([previewPosition, previewWidth, phoneModel, showPreview], () => {
 });
 
 // ---------- 初始化 ----------
-onMounted(() => {
+onMounted(async () => {
   loadFromStorage();
-  // 移动端默认隐藏预览，避免一进来就被全屏预览盖住编辑器
+  // 移动端默认隐藏预览
   if (window.matchMedia('(max-width: 768px)').matches) {
     showPreview.value = false;
   }
+
+  // 初始化 Milkdown 编辑器
+  try {
+    milkdownEditor = await Editor.make()
+      .config((ctx) => {
+        ctx.set(rootCtx, milkdownContainer.value);
+        ctx.set(defaultValueCtx, markdownText.value);
+        // listener: 编辑器内容变化 → 同步到 markdownText
+        ctx.get(listenerCtx).markdownUpdated((_, md) => {
+          if (isSettingEditor) return;
+          isFromEditor = true;
+          markdownText.value = md;
+          isFromEditor = false;
+        });
+      })
+      .use(listener)
+      .use(commonmark)
+      .use(gfm)
+      .create();
+  } catch (e) {
+    console.error('Milkdown 初始化失败:', e);
+  }
+
   convertMarkdown();
   setInterval(() => { now.value = Date.now(); }, 15000);
   if (showRecoveryBanner.value) {
     setTimeout(() => { showRecoveryBanner.value = false; }, 10000);
   }
+});
+
+onUnmounted(() => {
+  milkdownEditor?.destroy();
+  milkdownEditor = null;
 });
 </script>
 
@@ -1886,10 +1989,6 @@ body {
 .editor-container {
   flex: 1;
   overflow: hidden;
-}
-
-.notion-editor {
-  height: 100% !important;
 }
 
 /* ========== 拖拽分隔线 ========== */
@@ -2697,47 +2796,40 @@ body {
 </style>
 
 <style scoped>
-:deep(.md-editor) {
-  height: 100% !important;
-  border: none !important;
-  background: var(--bg-primary) !important;
+/* ========== Milkdown 编辑器样式 ========== */
+.milkdown-theme-editor {
+  height: 100%;
+  overflow-y: auto;
+  background: #ffffff;
 }
 
-:deep(.md-editor-nav) {
-  background: var(--bg-secondary) !important;
-  border-bottom: 1px solid var(--border-light) !important;
+:deep(.milkdown) {
+  min-height: 100%;
+  outline: none;
 }
 
-:deep(.md-editor-toolbar) {
-  background: var(--bg-primary) !important;
-  border-bottom: 1px solid var(--border-light) !important;
+:deep(.milkdown .ProseMirror) {
+  min-height: 100%;
+  outline: none;
+  word-wrap: break-word;
+  white-space: pre-wrap;
 }
 
-:deep(.md-editor-content) {
-  background: var(--bg-primary) !important;
+:deep(.milkdown .ProseMirror:focus) {
+  outline: none;
 }
 
-:deep(.md-editor-content textarea) {
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif !important;
-  font-size: 15px !important;
-  line-height: 1.8 !important;
-  letter-spacing: 0.3px !important;
-  color: var(--text-primary) !important;
-  padding: 24px 32px !important;
-  caret-color: var(--accent-blue) !important;
+/* 占位符样式（空文档时显示） */
+:deep(.milkdown .ProseMirror p.is-editor-empty:first-child::before) {
+  content: attr(data-placeholder);
+  float: left;
+  color: var(--text-tertiary);
+  pointer-events: none;
+  height: 0;
 }
 
-:deep(.md-editor-text-input) {
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif !important;
-  font-size: 15px !important;
-  line-height: 1.8 !important;
-  letter-spacing: 0.3px !important;
-  color: var(--text-primary) !important;
-}
-
-:deep(.md-editor-preview) {
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif !important;
-  padding: 24px 32px !important;
-  line-height: 1.8 !important;
+/* 选区颜色 */
+:deep(.milkdown .ProseMirror ::selection) {
+  background: rgba(35, 131, 226, 0.15);
 }
 </style>
