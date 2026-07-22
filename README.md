@@ -6,6 +6,16 @@
 
 ---
 
+## 🚀 快速体验
+
+不想装环境？直接打开就能用：
+
+- **🌐 在线试用（全球版 · GitHub Pages）**：[https://yandanyi54-star.github.io/jingpai/](https://yandanyi54-star.github.io/jingpai/)
+- **🚀 在线试用（国内版 · 打开更快）**：[https://456e4ce4242b4534bd3e543f74fadae2.app.codebuddy.work/](https://456e4ce4242b4534bd3e543f74fadae2.app.codebuddy.work/)
+- **📖 产品故事（作品集案例文档）**：[docs/净排-产品案例.md](docs/净排-产品案例.md) — 给产品招聘官看的项目复盘
+
+---
+
 ## 快速开始
 
 ```bash
